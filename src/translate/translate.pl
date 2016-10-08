@@ -158,9 +158,9 @@ def _checkInitError(error):
     """
     Replace openvr error return code with a python exception
     """
-    if error.value != VRInitError_None.value:
+    if error != VRInitError_None:
         shutdown()
-        raise OpenVRError(getVRInitErrorAsSymbol(error) + str(error))    
+        raise OpenVRError("%s (error number %d)" %(getVRInitErrorAsSymbol(error), error))
 
 
 # Copying VR_Init inline implementation from https://github.com/ValveSoftware/openvr/blob/master/headers/openvr.h
@@ -176,7 +176,7 @@ def init(applicationType):
     """
     initInternal(applicationType)
     # Retrieve "System" API
-    return IVRSystem()
+    return VRSystem()
 
 
 def shutdown():
@@ -250,6 +250,9 @@ EOF
                 $arg_name = $1;
                 $arg_name = lcfirst($arg_name);
             }
+            
+            # avoid reserved words in argument name
+            $arg_name =~ s/^type$/type_/;
 
             if ($arg_type eq "POINTER\(EVRInitError\)") {
                 # Handle error argument specially
@@ -297,13 +300,17 @@ EOF
             print "    $error_arg_name = EVRInitError()\n";
         }
 
-        print "    result = _openvr.$fn_name(";
+        print "    "; # indent
+        if ($return_type ne "None") { # avoid IDE warning when "result" value is unused
+        	print "result = ";
+        }
+        print "    _openvr.$fn_name(";
         print join ", ", @arg_names;
         print ")\n";
 
         # Raise exception if error state returned
         if (defined $error_arg_name) {
-            print "    _checkInitError($error_arg_name)\n";
+            print "    _checkInitError(${error_arg_name}.value)\n";
         }
         if ($#py_return_val_names >= 0) {
             print "    return ";
@@ -422,6 +429,7 @@ sub translate_enums {
 #############################
 
 ENUM_TYPE = c_uint32
+ENUM_VALUE_TYPE = int
 
 EOF
 
@@ -463,7 +471,7 @@ EOF
             {
             	$item =~ s/^${enum_name1}_//; # strip outer enum name from value
             }
-            print "$item = ENUM_TYPE($value)\n"
+            print "$item = ENUM_VALUE_TYPE($value)\n"
         }
         print "\n";
 
@@ -565,6 +573,12 @@ EOF
         }
 
         $struct_name = translate_type($struct_name);
+        
+        # Special handling of COpenVRContext class
+        if ($struct_name =~ m/^COpenVRContext$/) {
+        	expose_openvr_context($struct_contents);
+        	next;
+        }
 
         # Add special methods to vector classes
         if ($struct_name =~ m/^HmdVector/) {
@@ -603,13 +617,14 @@ EOF
                 my @fn_args = ();
                 # "first" argument is the return type
                 push @fn_args, translate_type($return_type);
+                # Iterate over second through nth arguments
                 foreach my $arg (split ",", $fn_args0) {
-                    die unless $arg =~ s/^\s*(.*\S)\s+(\S+)\s*$//;
+                    die unless $arg =~ m/^\s*(.*\S)\s+(\S+)\s*$/;
                     my $arg_type = $1;
                     my $arg_name = $2;
                     $arg_type = translate_type($arg_type);
                     push @fn_args, $arg_type;
-                    # TODO: remember the array arg type
+                    # Store inout array argument type for later processing
                     if (exists $inout_array_arguments{$fn_name}) {
                         if ($arg_name eq $inout_array_arguments{$fn_name}[0]) {
                             die $arg_type unless $arg_type =~ /POINTER\((.*)\)/;
@@ -734,6 +749,9 @@ EOF
                         die unless $arg =~ m/^\s*(.*)\s+(\S+)\s*$/;
                         my $arg_type = $1;
                         my $arg_name = $2;
+                        
+                        # avoid reserved words in argument name
+                        $arg_name =~ s/^type$/type_/;
 
                         $arg_type = translate_type($arg_type);
                         push @arg_types, $arg_type;
@@ -741,11 +759,19 @@ EOF
                             push @internal_arg_names, $arg_name;
                             push @return_arg_names, $arg_name;
                         }
+                        # Pointer arguments are assumed to be OUTPUT arguments at this point
                         elsif ($arg_type =~ m/^POINTER\((.*)\)/) {
                             my $pointee_type = $1;
                             push @return_arg_types, $pointee_type;
                             push @internal_arg_names, "byref($arg_name)";
-                            push @return_arg_names, $arg_name;
+                            # Pointers to primitive types return the .value member
+                            if ($pointee_type =~ m/^c_/) {
+	                            push @return_arg_names, "${arg_name}.value";
+								# print "VALUE ${arg_name}\n";
+                            }
+                            else {
+	                            push @return_arg_names, $arg_name;
+                            }
                         }
                         else {
                             push @internal_arg_names, $arg_name;
@@ -767,9 +793,12 @@ EOF
                     print_docstring($fn_name, "        ");
 
                     print "        fn = self.function_table.$fn_name\n";
-                    foreach my $ret_name (@return_arg_names) {
+					# Assign local variables for return/out arguments
+                    foreach my $ret_name0 (@return_arg_names) {
+						my $ret_name = $ret_name0;
                         next if $ret_name =~ m/^result$/;
                         next if defined $array_arg_name and $ret_name eq $array_arg_name; # handled below
+                        $ret_name =~ s/\.value$//;
                         print "        $ret_name = ";
                         print shift @return_arg_types;
                         print "()\n";
@@ -782,7 +811,12 @@ EOF
                         print "        $array_arg_name = cast($array_arg_name, POINTER($array_arg_pointee_type))\n";
                     }
 
-                    print "        result = fn(";
+                    print "        "; # indent
+                    if ($return_type !~ m/^void$/) {
+                    	# avoid IDE warning when "result"" value is unused
+                        print "result = ";
+                    }
+                    print "fn(";
                     print join ", ", @internal_arg_names;
                     print ")\n";
                     if ($#return_arg_names >= 0) {
@@ -799,6 +833,74 @@ EOF
 
     }
     # print $struct_count2, "\n";    
+}
+
+sub expose_openvr_context {
+	my $struct_contents = shift;
+	my @fields = split('\n', $struct_contents);
+	my @context_classes = ();
+	foreach my $field (@fields) {
+		$field =~ s/^\s*//;
+		$field =~ s/\s*$//;
+		next unless $field =~ m/\S/;
+		# print "# $field #\n";
+		# "intptr_t m_pVRChaperoneSetup; // class vr::IVRChaperoneSetup *"
+		die $field unless $field =~ m/^intptr_t\s+m_p(VR\S+);/; 
+		my $cls_root = $1; # e.g. "VRChaperoneSetup"
+		push @context_classes, $cls_root
+	}
+    # exit(0); # TODO
+
+    print <<EOF;
+class COpenVRContext(object):
+    def __init__(self):
+        self.clear()
+        
+    def checkClear(self):
+        global _vr_token
+        if _vr_token != getInitToken():
+            self.clear()
+            _vr_token = getInitToken()
+            
+    def clear(self):  
+EOF
+
+	# enumerate members to clear in clear method
+	foreach my $cls_name (@context_classes) {
+		print "        self.m_p$cls_name = None\n";
+	}
+
+	# enumerate accessors for each interface class types
+	foreach my $cls_name (@context_classes) {
+		print <<EOF;
+
+    def $cls_name(self):
+        self.checkClear()
+        if self.m_p$cls_name is None:
+            self.m_p$cls_name = I$cls_name()
+        return self.m_p$cls_name
+EOF
+	}
+
+    print <<EOF;
+
+
+# Globals for context management
+_vr_token = None
+_internal_module_context = COpenVRContext()
+
+
+EOF
+
+	# enumerate global accessors for each interface class type
+	foreach my $cls_name (@context_classes) {
+		print <<EOF;
+def ${cls_name}():
+    return _internal_module_context.${cls_name}()
+
+EOF
+	}
+
 }
 
 sub translate_type {
